@@ -151,6 +151,10 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                 henstilling_id = row["Løbenummer"].strip()
                 if not henstilling_id:
                     continue
+                
+                ejerinfo = row.get("Ejerinfo", "").strip()
+                if not (ejerinfo.isdigit() and len(ejerinfo) == 8):
+                    continue
 
                 cvr = int(row["Ejerinfo"].strip())
                 startdato = datetime.strptime(row["StartDato"].split()[0], "%d-%m-%Y").date()
