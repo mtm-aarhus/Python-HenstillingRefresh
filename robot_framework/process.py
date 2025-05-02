@@ -51,7 +51,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     cursor = conn.cursor()
 
     cursor.execute("SELECT DB_NAME()")
-    print("Connected to DB:", cursor.fetchone()[0])
+    orchestrator_connection.log_info("Connected to DB:", cursor.fetchone()[0])
 
     download_dir = str(Path.home() / "Downloads")
         
@@ -120,11 +120,11 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         csv_files = [file for file in new_files if file.lower().endswith(".csv")]
         if csv_files:
             downloaded_file = os.path.join(download_dir, csv_files[0])
-            print(f"Download completed: {downloaded_file}")
+            orchestrator_connection.log_info(f"Download completed: {downloaded_file}")
             break
 
         if time.time() - start_time > timeout:
-            print("Timeout reached while waiting for a download.")
+            orchestrator_connection.log_info("Timeout reached while waiting for a download.")
             break
 
         time.sleep(1)
@@ -167,7 +167,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                     longitude = float(row["Longitude"].replace(",", "."))
                     latitude, longitude = replace_coord_if_too_close(adresse, latitude, longitude)
                 except ValueError:
-                    print(f"{henstilling_id} has invalid lat/lon, skipping")
+                    orchestrator_connection.log_info(f"{henstilling_id} has invalid lat/lon, skipping")
                     continue
 
                 row_exists = henstilling_id in existing_rows
@@ -186,7 +186,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                         """, (
                             startdato, slutdato, adresse, forseelse, longitude, latitude, henstilling_id
                         ))
-                        print(f"Updated {henstilling_id} without changing FirmaNavn")
+                        orchestrator_connection.log_info(f"Updated {henstilling_id} without changing FirmaNavn")
                     else:
                         # CVR changed — fetch new name and update
                         firmanavn = get_firmanavn(cvr)
@@ -197,7 +197,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                         """, (
                             cvr, firmanavn, startdato, slutdato, adresse, forseelse, longitude, latitude, henstilling_id
                         ))
-                        print(f"Updated {henstilling_id} with new FirmaNavn: {firmanavn}")
+                        orchestrator_connection.log_info(f"Updated {henstilling_id} with new FirmaNavn: {firmanavn}")
                 else:
                     # New row — insert
                     firmanavn = get_firmanavn(cvr)
@@ -211,9 +211,9 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                             henstilling_id, cvr, firmanavn, startdato, slutdato, adresse,
                             forseelse, longitude, latitude, "Ny"
                         ))
-                        print(f"Inserted {henstilling_id} - {firmanavn}")
+                        orchestrator_connection.log_info(f"Inserted {henstilling_id} - {firmanavn}")
                     else:
-                        print(f"Ugyldigt CVR eller manglende firmanavn")
+                        orchestrator_connection.log_info(f"Ugyldigt CVR eller manglende firmanavn")
                         cursor.execute("""
                             INSERT INTO [dbo].[VejmanKassen] (
                                 HenstillingId, CVR, FirmaNavn, Startdato, Slutdato, Adresse,
@@ -225,7 +225,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
                         ))
 
             except Exception as e:
-                print(f"Error processing row {row.get('Løbenummer', '???')}: {e}")
+                orchestrator_connection.log_info(f"Error processing row {row.get('Løbenummer', '???')}: {e}")
 
     conn.commit()
     conn.close()
