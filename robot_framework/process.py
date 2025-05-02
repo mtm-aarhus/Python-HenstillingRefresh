@@ -51,7 +51,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     cursor = conn.cursor()
 
     cursor.execute("SELECT DB_NAME()")
-    orchestrator_connection.log_info("Connected to DB:", cursor.fetchone()[0])
+    orchestrator_connection.log_info(f"Connected to DB: {cursor.fetchone()[0]}")
 
     download_dir = str(Path.home() / "Downloads")
         
