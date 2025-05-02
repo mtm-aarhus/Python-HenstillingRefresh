@@ -230,6 +230,11 @@ with open(downloaded_file, encoding="cp1252") as f:
     for row in reader:
         if row["Status på sagen"].strip() != "Henstilling til oppfølging":
             continue
+        
+        ejerinfo = row.get("Ejerinfo", "").strip()
+        if not (ejerinfo.isdigit() and len(ejerinfo) == 8):
+            print(f"{ejerinfo} is not a valid cvr number, skipping")
+            continue
 
         try:
             henstilling_id = row["Løbenummer"].strip()
