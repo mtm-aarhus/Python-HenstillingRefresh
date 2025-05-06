@@ -47,7 +47,17 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
         f"Connection Timeout=30;"
     )
 
-    conn = pyodbc.connect(SQL_CONN_STRING)
+    retries = 3
+    for attempt in range(retries):
+        try:
+            conn = pyodbc.connect(SQL_CONN_STRING)
+            break
+        except pyodbc.OperationalError as e:
+            if attempt < retries - 1:
+                print(f"Connection failed, retrying... ({attempt+1}/{retries})")
+                time.sleep(5)
+            else:
+                raise e
     cursor = conn.cursor()
 
     cursor.execute("SELECT DB_NAME()")
