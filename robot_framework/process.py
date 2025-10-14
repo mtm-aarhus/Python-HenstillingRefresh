@@ -7,20 +7,24 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from pathlib import Path
-import os
 from datetime import datetime
 import time
-import csv
+import re
 import requests
-import pyodbc
+from functools import lru_cache
 from math import radians, cos, sin, asin, sqrt
 import regex
+from azure.cosmos import CosmosClient
+
 
 CVR_API_URL = "https://cvrapi.dk/api"
 USER_AGENT = "Henstillinger AAK"
 DEPOT = (56.161147, 10.13455)
-
+# --- Overtrædelser der må faktureres ---
+ALLOWED_NUMRE = {
+    "1B.", "2B.", "3B.", "4B.", "5B.", "7B.",
+    "8B.", "9B.", "10B.", "12B.", "19B.", "23B."
+}
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     """Do the primary process of the robot."""
     orchestrator_connection.log_trace("Running process.")
@@ -28,48 +32,23 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     username = Credentials.username
     password = Credentials.password
     url = orchestrator_connection.get_constant("MobilityWorkspaceURL").value
-    sql_credentials = orchestrator_connection.get_credential("AzureSQL")
-    sql_user = sql_credentials.username
-    sql_password = sql_credentials.password
-    sql_server = orchestrator_connection.get_constant("VejmanHistorikSQL").value
+    cosmos_credentials = orchestrator_connection.get_credential("AAKTilsynDB")
+    COSMOS_URL = cosmos_credentials.username
+    COSMOS_KEY = cosmos_credentials.password
+    
+    DB_NAME = "aak-tilsyn"
+    CONTAINER = "henstillinger"
 
+    client = CosmosClient(COSMOS_URL, COSMOS_KEY)
+    container = client.get_database_client(DB_NAME).get_container_client(CONTAINER)
+    all_results = []
     # Azure SQL connection string
-    SQL_CONN_STRING = (
-        f"Driver={{ODBC Driver 17 for SQL Server}};"
-        f"Server=tcp:{sql_server};"
-        f"Database=TilladelsesHistorik;"
-        f"Persist Security Info=False;"
-        f"UID={sql_user};"
-        f"PWD={sql_password};"
-        f"MultipleActiveResultSets=False;"
-        f"Encrypt=yes;"
-        f"TrustServerCertificate=no;"
-        f"Connection Timeout=30;"
-    )
 
-    retries = 3
-    for attempt in range(retries):
-        try:
-            conn = pyodbc.connect(SQL_CONN_STRING)
-            break
-        except pyodbc.OperationalError as e:
-            if attempt < retries - 1:
-                print(f"Connection failed, retrying... ({attempt+1}/{retries})")
-                time.sleep(5)
-            else:
-                raise e
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT DB_NAME()")
-    orchestrator_connection.log_info(f"Connected to DB: {cursor.fetchone()[0]}")
-
-    download_dir = str(Path.home() / "Downloads")
         
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument('--remote-debugging-pipe')
     options.add_experimental_option("prefs", {
-        "download.default_directory": download_dir,
         "download.prompt_for_download": False,
         "download.directory_upgrade": True,
         "safebrowsing.enabled": True
@@ -87,182 +66,83 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     except Exception:
         pass  # Login might not be required
 
-    driver.get(f"{url}/parking/tab/4.6")
+    # --- Navigate to the correct page ---
+    driver.get(f"{url}/parking/tab/1.2")
 
-    henstillinger_link = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, "//a[span[text()='Henstillinger']]")
-    ))    
-    henstillinger_link.click()
+        # Reset first to '- Vælg -'
+    select_predefined_filter(driver, wait, "")
 
-    wait.until(EC.visibility_of_element_located((
-    By.XPATH,
-    "//div[contains(@class, 'wicket-modal')]//span[@class='w_captionText' and text()='Henstillinger']"
-    )))
+    # Then select your actual one
+    select_predefined_filter(driver, wait, "5aac770d-73ad-40ca-9493-42cfc7f2b1c3")
 
-    from_date_input = wait.until(EC.presence_of_element_located((
-        By.XPATH,
-        "//label[text()='From date']/following::input[@type='text'][1]"
-    )))
+    # (optional) wait for the table or 'Søg' button to appear again
+    wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='Søg']")))
 
-    to_date_input = wait.until(EC.presence_of_element_located((
-        By.XPATH,
-        "//label[text()='To date']/following::input[@type='text'][1]"
-    )))
+    # Click "Søg"
+    search_button = driver.find_element(By.XPATH, "//input[@type='submit' and @value='Søg']")
+    search_button.click()
+    
+    # --- After clicking "Søg" ---
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.tabell.radlink")))
 
+    prev_btn = driver.find_element(
+                By.XPATH, "//button[contains(@title, 'Go to previous page')]"
+            )
+    if not prev_btn.get_attribute("disabled"):
+        first_page_link = driver.find_element(
+            By.XPATH, "//a[@title='Go to page 1']"
+        )
+        driver.execute_script("arguments[0].click();", first_page_link)
 
-    from_date_input.clear()
-    from_date_input.send_keys("01-01-20")
-    to_date_input.clear()
-    to_date_input.send_keys(datetime.now().strftime("%d-%m-%y"))
-
-    initial_files = set(os.listdir(download_dir))
-
-    driver.find_element(By.XPATH, '//input[@type="submit" and @value="OK"]').click()
-
-    # Wait for download to complete
-    timeout = 60
-    start_time = time.time()
-    downloaded_file = None
-
+        # Wait for the first page to become active (no href, title='Go to page 1')
+        wait.until(EC.presence_of_element_located((
+            By.XPATH, "//span[@title='Go to page 1'][not(ancestor::a)]"
+        )))
+        
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.tabell.radlink")))
+        
+        
+    all_results = []
+    page_number = 1
     while True:
-        current_files = set(os.listdir(download_dir))
-        new_files = current_files - initial_files
-        csv_files = [file for file in new_files if file.lower().endswith(".csv")]
-        if csv_files:
-            downloaded_file = os.path.join(download_dir, csv_files[0])
-            orchestrator_connection.log_info(f"Download completed: {downloaded_file}")
-            break
+        all_results.extend(process_page(driver, wait, container, orchestrator_connection, all_results))
 
-        if time.time() - start_time > timeout:
-            orchestrator_connection.log_info("Timeout reached while waiting for a download.")
-            break
+        # Try clicking "Næste" if it exists
+        next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Næste')]")))
+        next_btn.click()
+        page_number += 1
+        page_xpath = f"//span[@title='Go to page {page_number}'][not(ancestor::a)]"
 
-        time.sleep(1)
+        wait.until(EC.presence_of_element_located((By.XPATH, page_xpath)))
+        wait.until(EC.presence_of_element_located(
+        (By.XPATH, "//th[a[normalize-space(text())='Overtrædelse 1']]")
+        ))
+
+        # Return rows of that table
+        table = driver.find_element(
+            By.XPATH, "//table[.//th[a[normalize-space(text())='Overtrædelse 1']]]"
+        )
+        rows = table.find_elements(By.CSS_SELECTOR, "tbody tr.tabellrad")
+        if len(rows) == 0:
+            break
+        if page_number > 50:
+            break
 
     driver.quit()
+    orchestrator_connection.log_info("All pages processed and saved.")
 
-    if not downloaded_file:
-        raise FileNotFoundError("No CSV file was downloaded.")
 
-    cursor.execute("SELECT HenstillingId, CVR, FakturaStatus FROM [dbo].[VejmanKassen]")
-    existing_rows = {
-        row.HenstillingId: {"CVR": row.CVR, "FakturaStatus": row.FakturaStatus}
-        for row in cursor.fetchall()
-    }
 
-    # --- Process CSV ---
-    with open(downloaded_file, encoding="cp1252") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            if row["Status på sagen"].strip() != "Henstilling til oppfølging":
-                continue
-
-            try:
-                henstilling_id = row["Løbenummer"].strip()
-                if not henstilling_id:
-                    continue
-                
-                ejerinfo = row.get("Ejerinfo", "").strip()
-                if not (ejerinfo.isdigit() and len(ejerinfo) == 8):
-                    continue
-
-                cvr = int(row["Ejerinfo"].strip())
-                startdato = datetime.strptime(row["StartDato"].split()[0], "%d-%m-%Y").date()
-                slutdato = datetime.strptime(row["SlutDato"].split()[0], "%d-%m-%Y").date()
-
-                gade = row["Gade"].strip()
-                husnr = row["Husnummer"].strip()
-                adresse = f"{gade} {husnr}".strip()
-
-                forseelse = row["Navn på forseelse"].strip()
-
-                try:
-                    latitude = float(row["Latitude"].replace(",", "."))
-                    longitude = float(row["Longitude"].replace(",", "."))
-                    latitude, longitude = replace_coord_if_too_close(adresse, latitude, longitude)
-                except ValueError:
-                    orchestrator_connection.log_info(f"{henstilling_id} has invalid lat/lon, skipping")
-                    continue
-
-                row_exists = henstilling_id in existing_rows
-
-                if row_exists:
-                    existing = existing_rows[henstilling_id]
-                    if existing["FakturaStatus"] is not None and existing["FakturaStatus"] != "Ny":
-                        continue  # Skip update if FakturaStatus already set and not "Ny"
-
-                    if existing["CVR"] == cvr:
-                        # CVR unchanged — skip CVR lookup and leave FirmaNavn alone
-                        cursor.execute("""
-                            UPDATE [dbo].[VejmanKassen]
-                            SET Startdato = ?, Slutdato = ?, Adresse = ?, Forseelse = ?, Longitude = ?, Latitude = ?
-                            WHERE HenstillingId = ?
-                        """, (
-                            startdato, slutdato, adresse, forseelse, longitude, latitude, henstilling_id
-                        ))
-                        orchestrator_connection.log_info(f"Updated {henstilling_id} without changing FirmaNavn")
-                    else:
-                        # CVR changed — fetch new name and update
-                        firmanavn = get_firmanavn(cvr)
-                        cursor.execute("""
-                            UPDATE [dbo].[VejmanKassen]
-                            SET CVR = ?, FirmaNavn = ?, Startdato = ?, Slutdato = ?, Adresse = ?, Forseelse = ?, Longitude = ?, Latitude = ?
-                            WHERE HenstillingId = ?
-                        """, (
-                            cvr, firmanavn, startdato, slutdato, adresse, forseelse, longitude, latitude, henstilling_id
-                        ))
-                        orchestrator_connection.log_info(f"Updated {henstilling_id} with new FirmaNavn: {firmanavn}")
-                else:
-                    # New row — insert
-                    firmanavn = get_firmanavn(cvr)
-                    if firmanavn:
-                        cursor.execute("""
-                            INSERT INTO [dbo].[VejmanKassen] (
-                                HenstillingId, CVR, FirmaNavn, Startdato, Slutdato, Adresse,
-                                Forseelse, Longitude, Latitude, FakturaStatus
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            henstilling_id, cvr, firmanavn, startdato, slutdato, adresse,
-                            forseelse, longitude, latitude, "Ny"
-                        ))
-                        orchestrator_connection.log_info(f"Inserted {henstilling_id} - {firmanavn}")
-                    else:
-                        orchestrator_connection.log_info(f"Ugyldigt CVR eller manglende firmanavn")
-                        cursor.execute("""
-                            INSERT INTO [dbo].[VejmanKassen] (
-                                HenstillingId, CVR, FirmaNavn, Startdato, Slutdato, Adresse,
-                                Forseelse, Longitude, Latitude, FakturaStatus
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            henstilling_id, cvr, "Ugyldigt CVR eller manglende firmanavn", startdato, slutdato, adresse,
-                            forseelse, longitude, latitude, "Ny"
-                        ))
-
-            except Exception as e:
-                orchestrator_connection.log_info(f"Error processing row {row.get('Løbenummer', '???')}: {e}")
-
-    conn.commit()
-    conn.close()
-
-    os.remove(downloaded_file)
-
-# --- CVR lookup helper ---
-def get_firmanavn(cvr):
+def extract_latlon_from_maplink(driver):
+    """Find Google Maps link and extract lat/lon if present."""
     try:
-        r = requests.get(CVR_API_URL, params={
-            "country": "dk",
-            "search": cvr
-        }, headers={"User-Agent": USER_AGENT}, timeout=5)
-
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("name", None)
-        else:
-            print(f"CVR lookup failed for {cvr}: status {r.status_code}")
-            return None
-    except Exception as e:
-        print(f"Exception during CVR lookup for {cvr}: {e}")
-        return None
+        link = driver.find_element(By.XPATH, "//a[contains(@href, 'maps.google.com/maps?ll=')]").get_attribute("href")
+        match = re.search(r"ll=([-+]?\d*\.\d+),([-+]?\d*\.\d+)", link)
+        if match:
+            return float(match.group(1)), float(match.group(2))
+    except Exception:
+        pass
+    return None, None
 
 def haversine(coord1, coord2):
     lat1, lon1 = coord1
@@ -273,23 +153,6 @@ def haversine(coord1, coord2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     c = 2 * asin(sqrt(a))
     return R * c
-
-def get_firmanavn(cvr):
-    try:
-        r = requests.get(CVR_API_URL, params={
-            "country": "dk",
-            "search": cvr
-        }, headers={"User-Agent": USER_AGENT}, timeout=5)
-
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("name", None)
-        else:
-            print(f"CVR lookup failed for {cvr}: status {r.status_code}")
-            return None
-    except Exception as e:
-        print(f"Exception during CVR lookup for {cvr}: {e}")
-        return None
     
 def geocode_address(address: str) -> tuple | None:
     url = "https://nominatim.openstreetmap.org/search"
@@ -331,3 +194,299 @@ def replace_coord_if_too_close(address, latitude, longitude, threshold_m=100) ->
         latitude = new_coord[0]
         longitude = new_coord[1]
     return latitude, longitude
+
+def process_page(driver, wait, container, orchestrator_connection, all_results):
+    """Iterate rows, open details, extract widgets, update/insert DB."""
+    rows = driver.find_elements(By.CSS_SELECTOR, "table.tabell.radlink tbody tr.tabellrad")
+    total_rows = len(rows)
+    orchestrator_connection.log_info(f"Found {total_rows} rows on this page.")
+
+    for idx in range(total_rows):
+        # Wait for the header to appear (ensures correct table)
+        wait.until(EC.presence_of_element_located(
+            (By.XPATH, "//th[a[normalize-space(text())='Overtrædelse 1']]")
+        ))
+
+        # Once header is present, safely get all rows under that table
+        table = driver.find_element(
+            By.XPATH, "//table[.//th[a[normalize-space(text())='Overtrædelse 1']]]"
+        )
+        rows = table.find_elements(By.CSS_SELECTOR, "tbody tr.tabellrad")
+        row = rows[idx]
+        driver.execute_script("arguments[0].scrollIntoView(true);", row)
+        row.click()
+        back_link = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.tilbakelink")))
+
+        # --- Extract all widgets ---
+        widgets = extract_all_widgets(driver)
+        
+        overtrædelse_info = widgets.get("Overtrædelse", {})
+        ejerinfo = widgets.get("Ejerinfo", {})
+        kontrol_info = widgets.get("Kontrolgebyrsinformation", {})
+        
+        henstilling_id = kontrol_info.get("Nummer")
+        
+        if not henstilling_id:
+            orchestrator_connection.log_info("Missing Henstilling ID, skipping entry.")
+            back_link.click()
+            continue
+
+        
+        forseelser = []
+        for k, v in (overtrædelse_info or {}).items():
+            if not v or not isinstance(v, str) or not k.lower().startswith("overtrædelse"):
+                continue
+            tokens = v.strip().split(maxsplit=1)
+            first = tokens[0]
+            if first in ALLOWED_NUMRE:
+                nummer = int(k.split()[-1])
+                forseelser.append({"nummer": nummer, "text": v.strip()})
+                
+        if len(forseelser) == 0:
+            back_link.click()
+            continue
+        
+        cvr = None
+        if ejerinfo.get("Type") == "Organisationsnr.":
+            cvr_raw = ejerinfo.get("Nummer")
+            if cvr_raw:
+                cvr = int(cvr_raw) if cvr_raw.isdigit() else None
+            else:
+                orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
+                back_link.click()
+                continue
+        else:
+            orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
+            back_link.click()
+            continue
+        
+
+
+        # --- Latitude/Longitude ---
+        latitude, longitude = extract_latlon_from_maplink(driver)
+        # --- Fallback to geocoding if no coords ---
+        Vejnavn = kontrol_info.get("Gade") or None
+        Husnummer = kontrol_info.get("Husnummer") or None
+        address_text = None
+        if Vejnavn:
+            if Husnummer:
+                address_text = Vejnavn+" "+Husnummer
+            else:
+                address_text = Vejnavn
+                
+        if latitude and longitude:
+            latitude, longitude = replace_coord_if_too_close(address_text, latitude, longitude, 100)
+        
+        if not latitude or not longitude:
+            if address_text:
+                geocoded = geocode_address(address_text)
+                if geocoded:
+                    latitude, longitude = geocoded
+
+        # --- CVR and company name lookup ---
+
+        
+        firmanavn = ejerinfo.get("Navn") or get_firmanavn_cached(container, cvr) or "Ugyldigt CVR"
+
+        # --- Start/End Dates ---
+        startdato = kontrol_info.get("Fra")
+        slutdato = kontrol_info.get("Til")
+        
+        try:
+            if startdato:
+                startdato = datetime.strptime(startdato.split()[0], "%d-%m-%y").date()
+            if slutdato:
+                slutdato = datetime.strptime(slutdato.split()[0], "%d-%m-%y").date()
+        except Exception:
+            startdato = slutdato = None
+
+        try:
+            if kontrol_info.get("Fra"):
+                startdato = datetime.strptime(kontrol_info["Fra"].split()[0], "%d-%m-%y").date()
+            if kontrol_info.get("Til"):
+                slutdato = datetime.strptime(kontrol_info["Til"].split()[0], "%d-%m-%y").date()
+        except Exception:
+            pass
+
+
+        meta = {
+            "cvr": cvr,
+            "firmanavn": firmanavn,
+            "startdato": startdato,
+            "slutdato": slutdato,
+            "adresse": address_text,
+            "latitude": latitude,
+            "longitude": longitude
+        }
+        sync_henstilling(container, henstilling_id, forseelser, meta)
+        back_link.click()
+    return all_results
+
+def extract_all_widgets(driver):
+    """
+    Dynamically extract all widgets on the page based on their <h3> titles
+    and the content under .widgetinnhold. Returns a dict of dicts/lists.
+    """
+    widgets_data = {}
+
+    widgets = driver.find_elements(By.CSS_SELECTOR, "div.widget")
+    for widget in widgets:
+        try:
+            # Get the title (widgethead > h3)
+            title_el = widget.find_element(By.CSS_SELECTOR, ".widgethead h3")
+            title = title_el.text.strip()
+            if not title:
+                continue
+        except Exception:
+            continue
+
+        # Find the visible content section
+        try:
+            content_el = widget.find_element(By.CSS_SELECTOR, ".widgetinnhold")
+        except Exception:
+            continue
+
+        # Try to parse the content heuristically
+        section_data = parse_widget_content(content_el)
+        widgets_data[title] = section_data
+
+    return widgets_data
+
+
+def parse_widget_content(content_el):
+    """
+    Generic parser for the inner content of a widget.
+    Handles:
+    - propertytable (th/td pairs)
+    - tabell with headers
+    - plain text / spans
+    """
+    data = {}
+
+    # --- Case 1: Standard key/value table (propertytable) ---
+    kv_rows = content_el.find_elements(By.XPATH, ".//table[contains(@class,'propertytable')]/tbody/tr")
+    if kv_rows:
+        for tr in kv_rows:
+            try:
+                key = tr.find_element(By.TAG_NAME, "th").text.strip().rstrip(":")
+                val = tr.find_element(By.TAG_NAME, "td").text.strip()
+                data[key] = val
+            except Exception:
+                continue
+        return data
+
+    # --- Case 2: Tabular comment/record list ---
+    tab_rows = content_el.find_elements(By.XPATH, ".//table[contains(@class,'tabell')]/tbody/tr")
+    if tab_rows:
+        table_data = []
+        for tr in tab_rows:
+            cells = [td.text.strip() for td in tr.find_elements(By.TAG_NAME, "td")]
+            if any(cells):
+                table_data.append(cells)
+        return table_data
+
+    # --- Case 3: Plain text or nested spans ---
+    text_content = content_el.text.strip()
+    if text_content:
+        return text_content
+
+    return {}
+
+
+@lru_cache(maxsize=5000)
+def get_firmanavn_cached(container, cvr: int):
+    # Check Cosmos cache
+    query = """
+        SELECT TOP 1 c.FirmaNavn
+        FROM c
+        WHERE c.CVR = @cvr
+        AND IS_DEFINED(c.FirmaNavn)
+        AND IS_STRING(c.FirmaNavn)
+        AND LENGTH(TRIM(c.FirmaNavn)) > 0
+    """
+    results = list(container.query_items(
+        query=query,
+        parameters=[{"name": "@cvr", "value": int(cvr)}],
+        enable_cross_partition_query=True
+    ))
+    if results and results[0].get("FirmaNavn"):
+        return results[0]["FirmaNavn"]
+
+    # Fallback to CVR API
+    try:
+        r = requests.get(CVR_API_URL, params={"country": "dk", "search": cvr},
+                         headers={"User-Agent": USER_AGENT}, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("name")
+    except Exception as e:
+        print(f"CVR lookup failed for {cvr}: {e}")
+    return None
+
+def sync_henstilling(container, henstilling_id, forseelser, meta):
+    """
+    Sync henstilling data in Cosmos DB:
+    - Only inserts or updates rows that are 'Ny'
+    - Never deletes any rows (preserves locked statuses)
+    - Efficiently upserts items using partition keys
+    """
+
+    # 🔹 Fetch all docs for this Henstilling (any FakturaStatus)
+    existing_docs = list(container.query_items(
+        query="SELECT * FROM c WHERE c.HenstillingId = @h",
+        parameters=[{"name": "@h", "value": henstilling_id}],
+        enable_cross_partition_query=True
+    ))
+
+    # Build quick lookup by ID
+    existing_map = {d["id"]: d for d in existing_docs}
+
+    for f in forseelser:
+        fid = f"{henstilling_id}_{f['nummer']}"
+        existing = existing_map.get(fid)
+
+        # Skip locked statuses
+        if existing and existing.get("FakturaStatus") not in ("Ny"):
+            continue  # do not modify rows in other statuses
+
+
+        # Build new or updated item
+        item = {
+            "id": fid,
+            "HenstillingId": henstilling_id,
+            "ForseelseNr": f["nummer"],
+            "Forseelse": f["text"].strip().split(" ", 1)[1],
+            "CVR": meta.get("cvr"),
+            "FirmaNavn": meta.get("firmanavn"),
+            "Adresse": meta.get("adresse"),
+            "Latitude": meta.get("latitude"),
+            "Longitude": meta.get("longitude"),
+            "Startdato": str(meta.get("startdato")),
+            "Slutdato": existing.get("Slutdato") if existing else None,
+            "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
+            "Tilladelsestype": existing.get("Tilladelsestype") if existing else None,
+            "FakturaStatus": "Ny",
+        }
+
+        # Upsert is cheap and works fine when the partition key stays the same
+        container.upsert_item(body=item)
+
+            
+def select_predefined_filter(driver, wait, value):
+    """Selects a predefined filter safely, even after Wicket re-renders the DOM."""
+    select_xpath = "//select[@name='topLevelTabContent:content:filterPanel:predefinedFilter:definition']"
+
+    # Find the dropdown fresh every time
+    select_el = wait.until(EC.presence_of_element_located((By.XPATH, select_xpath)))
+
+    # Set the value and trigger change
+    driver.execute_script("""
+        const el = arguments[0];
+        el.value = arguments[1];
+        el.dispatchEvent(new Event('change'));
+    """, select_el, value)
+
+    # Wait for the next version of the dropdown to appear
+    time.sleep(1)
+    wait.until(EC.staleness_of(select_el))
+    wait.until(EC.presence_of_element_located((By.XPATH, select_xpath)))
