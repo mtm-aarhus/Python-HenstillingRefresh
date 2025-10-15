@@ -25,6 +25,19 @@ ALLOWED_NUMRE = {
     "1B.", "2B.", "3B.", "4B.", "5B.", "7B.",
     "8B.", "9B.", "10B.", "12B.", "19B.", "23B."
 }
+TILLADELSESTYPE_MAP = {
+    "9B.": "Henstilling Stillads m2",
+    "19B.": "Henstilling Byggeplads m2",
+    "23B.": "Henstilling Bygninger m2",
+    "8B.": "Henstilling Container m2",
+    "5B.": "Henstilling Kran m2",
+    "4B.": "Henstilling Lift m2",
+    "12B.": "Henstilling Materiel m2",
+    "7B.": "Henstilling Skurvogn m2",
+    "1B.": "Henstilling Afmærkning m2",
+    "10B.": "Henstilling Materiel m2"
+}
+
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     """Do the primary process of the robot."""
     orchestrator_connection.log_trace("Running process.")
@@ -233,15 +246,23 @@ def process_page(driver, wait, container, orchestrator_connection, all_results):
 
         
         forseelser = []
+
         for k, v in (overtrædelse_info or {}).items():
             if not v or not isinstance(v, str) or not k.lower().startswith("overtrædelse"):
                 continue
+
             tokens = v.strip().split(maxsplit=1)
-            first = tokens[0]
+            first = tokens[0]  # e.g. "9B."
+
             if first in ALLOWED_NUMRE:
                 nummer = int(k.split()[-1])
-                forseelser.append({"nummer": nummer, "text": v.strip()})
-                
+                tilladelsestype = TILLADELSESTYPE_MAP.get(first)
+                forseelser.append({
+                    "nummer": nummer,
+                    "text": v.strip(),
+                    "tilladelsestype": tilladelsestype
+                })
+
         if len(forseelser) == 0:
             back_link.click()
             continue
@@ -431,7 +452,7 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
     - Efficiently upserts items using partition keys
     """
 
-    # 🔹 Fetch all docs for this Henstilling (any FakturaStatus)
+    # Fetch all docs for this Henstilling (any FakturaStatus)
     existing_docs = list(container.query_items(
         query="SELECT * FROM c WHERE c.HenstillingId = @h",
         parameters=[{"name": "@h", "value": henstilling_id}],
@@ -464,7 +485,7 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
             "Startdato": str(meta.get("startdato")),
             "Slutdato": existing.get("Slutdato") if existing else None,
             "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
-            "Tilladelsestype": existing.get("Tilladelsestype") if existing else None,
+            "Tilladelsestype": (existing.get("Tilladelsestype") if existing and existing.get("Tilladelsestype") is not None else f.get("tilladelsestype")),
             "FakturaStatus": "Ny",
         }
 
