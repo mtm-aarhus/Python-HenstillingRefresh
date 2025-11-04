@@ -201,8 +201,9 @@ def replace_coord_if_too_close(address, latitude, longitude, threshold_m=100) ->
     if distance > threshold_m:
         return latitude, longitude
     cleaned_address = clean_address(address)
-    geocode_coord = geocode_address(cleaned_address)
     if cleaned_address:
+        geocode_coord = geocode_address(cleaned_address)
+    if geocode_coord:
         new_coord = geocode_coord
         latitude = new_coord[0]
         longitude = new_coord[1]
