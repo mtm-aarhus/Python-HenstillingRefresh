@@ -269,19 +269,27 @@ def process_page(driver, wait, container, orchestrator_connection, all_results):
             continue
         
         cvr = None
-        if ejerinfo.get("Type") == "Organisationsnr.":
-            cvr_raw = ejerinfo.get("Nummer")
-            if cvr_raw:
-                cvr = int(cvr_raw) if cvr_raw.isdigit() else None
-            else:
-                orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
-                back_link.click()
-                continue
-        else:
+        type_value = ejerinfo.get("Type")
+
+        if type_value != "Organisationsnr.":
+            orchestrator_connection.log_info(f"Not a company (Type={type_value}) for {henstilling_id}, skipping entry."            )
+            back_link.click()
+            continue
+
+        cvr_raw = ejerinfo.get("Nummer")
+
+        if not cvr_raw:
             orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
             back_link.click()
             continue
-        
+
+        if is_valid_cvr(cvr_raw):
+            cvr = int(cvr_raw)
+        else:
+            orchestrator_connection.log_info(f"Invalid CVR '{cvr_raw}' for {henstilling_id}, skipping entry.")
+            back_link.click()
+            continue
+
 
 
         # --- Latitude/Longitude ---
@@ -512,3 +520,14 @@ def select_predefined_filter(driver, wait, value):
     time.sleep(1)
     wait.until(EC.staleness_of(select_el))
     wait.until(EC.presence_of_element_located((By.XPATH, select_xpath)))
+
+    
+def is_valid_cvr(cvr_str: str) -> bool:
+    """Return True if CVR has 8 digits and passes modulus-11 validation."""
+    if len(cvr_str) != 8 or not cvr_str.isdigit():
+        return False
+
+    weights = [2, 7, 6, 5, 4, 3, 2, 1]
+    total = sum(int(d) * w for d, w in zip(cvr_str, weights))
+
+    return total % 11 == 0
