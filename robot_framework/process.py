@@ -198,6 +198,7 @@ def clean_address(address: str) -> str:
 def replace_coord_if_too_close(address, latitude, longitude, threshold_m=100) -> dict:
     coord = (latitude, longitude)
     distance = haversine(coord, DEPOT)
+    geocode_coord = None
     if distance > threshold_m:
         return latitude, longitude
     cleaned_address = clean_address(address)
