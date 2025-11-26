@@ -1,0 +1,86 @@
+from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
+from azure.cosmos import CosmosClient
+import os
+
+CATEGORY_NORMALIZATION = {
+    "3B.": "3A."
+}
+
+FAKTURALINJE_MAP = {
+    "10B.": "751_Materiel pr. kvadratmeter",
+    "12B.": "751_Materiel pr. kvadratmeter",
+    "19B.": "751_Byggeplads pr.kvadratmeter",
+    "1B.":  "751_Afmærkning pr.kvadratmeter",
+    "23B.": "751_Bygninger pr. kvadratmeter",
+    "2B.":  "751_Afmærkning pr.kvadratmeter",
+    "3A.":  "751_Afmærkning pr.kvadratmeter",
+    "4B.":  "751_Lift pr. kvadratmeter",
+    "5B.":  "751_Kran pr. kvadratmeter",
+    "7B.":  "751_Skurvogn pr. kvadratmeter",
+    "8B.":  "751_Container pr. kvadratmeter",
+    "9B.":  "751_Stillads pr. kvadratmeter",
+}
+
+def extract_category(forseelse: str) -> str | None:
+    if not forseelse:
+        return None
+    parts = forseelse.strip().split()
+    if not parts:
+        return None
+    prefix = parts[0]
+    normalized = CATEGORY_NORMALIZATION.get(prefix, prefix)
+    return normalized if normalized in FAKTURALINJE_MAP else None
+
+
+def run_migration(orchestrator_connection: OrchestratorConnection):
+
+    print("Starting Cosmos migration...")
+
+    cosmos_cred = orchestrator_connection.get_credential("AAKTilsynDB")
+    client = CosmosClient(cosmos_cred.username, cosmos_cred.password)
+    container = client.get_database_client("aak-tilsyn").get_container_client("henstillinger")
+
+    docs = list(container.query_items(
+        query="SELECT * FROM c",
+        enable_cross_partition_query=True
+    ))
+
+    updated = 0
+
+    for doc in docs:
+        forseelse_text = doc.get("Forseelse")
+        kategori = extract_category(forseelse_text)
+        if not kategori:
+            continue
+
+        if doc.get("id") == '78400692_2':
+            continue
+        correct = FAKTURALINJE_MAP[kategori]
+
+        # -----------------------------------------
+        # 1) Rename old field → Tilladelsestype_Old
+        # -----------------------------------------
+        if "Tilladelsestype" in doc:
+            print(doc.get("id"))
+            doc["Tilladelsestype_Old"] = doc["Tilladelsestype"]
+            del doc["Tilladelsestype"]
+
+        # -----------------------------------------
+        # 2) Add the new correct fakturalinje
+        # -----------------------------------------
+        doc["Tilladelsestype_Vejman"] = correct
+
+        container.upsert_item(doc)
+        updated += 1
+
+    print(f"Migration done. Updated {updated} documents.")
+
+
+if __name__ == "__main__":
+    orchestrator_connection = OrchestratorConnection(
+        "HenstillingMigration",
+        os.getenv("OpenOrchestratorSQL"),
+        os.getenv("OpenOrchestratorKey"),
+        None,
+    )
+    run_migration(orchestrator_connection)
