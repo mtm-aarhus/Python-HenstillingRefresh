@@ -1,0 +1,57 @@
+from azure.cosmos import CosmosClient
+from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
+import os
+
+def rename_tilladelsestype(orchestrator_connection):
+    print("Starting rename migration...")
+
+    cosmos_credentials = orchestrator_connection.get_credential("AAKTilsynDB")
+    COSMOS_URL = cosmos_credentials.username
+    COSMOS_KEY = cosmos_credentials.password
+    
+    client = CosmosClient(COSMOS_URL, COSMOS_KEY)
+    container = client.get_database_client("aak-tilsyn").get_container_client("henstillinger")
+
+    docs = container.query_items(
+        query="SELECT * FROM c",
+        enable_cross_partition_query=True
+    )
+
+    updated = 0
+    skipped = 0
+
+    for doc in docs:
+        # If no new field exists, skip
+        if "Tilladelsestype_Vejman" not in doc:
+            skipped += 1
+            continue
+
+        vejman_value = doc.get("Tilladelsestype_Vejman")
+        if vejman_value is None:
+            skipped += 1
+            continue
+
+        # Assign new value into old name
+        doc["Tilladelsestype"] = vejman_value
+
+        # Remove the new field
+        if "Tilladelsestype_Vejman" in doc:
+            del doc["Tilladelsestype_Vejman"]
+
+        container.upsert_item(doc)
+        updated += 1
+
+    print(
+        f"Rename migration completed — updated {updated}, skipped {skipped}"
+    )
+
+
+if __name__ == "__main__":
+    orchestrator_connection = OrchestratorConnection(
+        "HenstillingRenameMigration",
+        os.getenv("OpenOrchestratorSQL"),
+        os.getenv("OpenOrchestratorKey"),
+        None,
+    )
+
+    rename_tilladelsestype(orchestrator_connection)
