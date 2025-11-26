@@ -25,17 +25,32 @@ ALLOWED_NUMRE = {
     "1B.", "2B.", "3B.", "4B.", "5B.", "7B.",
     "8B.", "9B.", "10B.", "12B.", "19B.", "23B."
 }
-TILLADELSESTYPE_MAP = {
-    "9B.": "Henstilling Stillads m2",
-    "19B.": "Henstilling Byggeplads m2",
-    "23B.": "Henstilling Bygninger m2",
-    "8B.": "Henstilling Container m2",
-    "5B.": "Henstilling Kran m2",
-    "4B.": "Henstilling Lift m2",
-    "12B.": "Henstilling Materiel m2",
-    "7B.": "Henstilling Skurvogn m2",
-    "1B.": "Henstilling Afmærkning m2",
-    "10B.": "Henstilling Materiel m2"
+# TILLADELSESTYPE_MAP = {
+#     "9B.": "Henstilling Stillads m2",
+#     "19B.": "Henstilling Byggeplads m2",
+#     "23B.": "Henstilling Bygninger m2",
+#     "8B.": "Henstilling Container m2",
+#     "5B.": "Henstilling Kran m2",
+#     "4B.": "Henstilling Lift m2",
+#     "12B.": "Henstilling Materiel m2",
+#     "7B.": "Henstilling Skurvogn m2",
+#     "1B.": "Henstilling Afmærkning m2",
+#     "10B.": "Henstilling Materiel m2"
+# }
+
+FAKTURALINJE_MAP = {
+    "10B.": "751_Materiel pr. kvadratmeter",
+    "12B.": "751_Materiel pr. kvadratmeter",
+    "19B.": "751_Byggeplads pr.kvadratmeter",
+    "1B.":  "751_Afmærkning pr.kvadratmeter",
+    "23B.": "751_Bygninger pr. kvadratmeter",
+    "2B.":  "751_Afmærkning pr.kvadratmeter",
+    "3B.":  "751_Afmærkning pr.kvadratmeter",
+    "4B.":  "751_Lift pr. kvadratmeter",
+    "5B.":  "751_Kran pr. kvadratmeter",
+    "7B.":  "751_Skurvogn pr. kvadratmeter",
+    "8B.":  "751_Container pr. kvadratmeter",
+    "9B.":  "751_Stillads pr. kvadratmeter",
 }
 
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
@@ -258,7 +273,7 @@ def process_page(driver, wait, container, orchestrator_connection, all_results):
 
             if first in ALLOWED_NUMRE:
                 nummer = int(k.split()[-1])
-                tilladelsestype = TILLADELSESTYPE_MAP.get(first)
+                tilladelsestype = FAKTURALINJE_MAP.get(first)
                 forseelser.append({
                     "nummer": nummer,
                     "text": v.strip(),
@@ -495,7 +510,7 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
             "Startdato": str(meta.get("startdato")),
             "Slutdato": existing.get("Slutdato") if existing else None,
             "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
-            "Tilladelsestype": (existing.get("Tilladelsestype") if existing and existing.get("Tilladelsestype") is not None else f.get("tilladelsestype")),
+            "Tilladelsestype_Vejman": (existing.get("Tilladelsestype_Vejman") if existing and existing.get("Tilladelsestype_Vejman") is not None else f.get("tilladelsestype")),
             "FakturaStatus": "Ny",
         }
 
