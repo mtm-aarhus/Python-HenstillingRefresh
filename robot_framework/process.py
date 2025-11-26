@@ -510,7 +510,7 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
             "Startdato": str(meta.get("startdato")),
             "Slutdato": existing.get("Slutdato") if existing else None,
             "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
-            "Tilladelsestype_Vejman": (existing.get("Tilladelsestype_Vejman") if existing and existing.get("Tilladelsestype_Vejman") is not None else f.get("tilladelsestype")),
+            "Tilladelsestype": (existing.get("Tilladelsestype") if existing and existing.get("Tilladelsestype") is not None else f.get("tilladelsestype")),
             "FakturaStatus": "Ny",
         }
 
