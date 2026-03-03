@@ -25,7 +25,7 @@ FAKTURALINJE_MAP = {
     "1B.":  "751_Afmærkning pr.kvadratmeter",
     "23B.": "751_Bygninger pr. kvadratmeter",
     "2B.":  "751_Afmærkning pr.kvadratmeter",
-    "3B.":  "751_Afmærkning pr.kvadratmeter",
+    "3B.":  "751_Materiel pr. kvadratmeter",
     "4B.":  "751_Lift pr. kvadratmeter",
     "5B.":  "751_Kran pr. kvadratmeter",
     "7B.":  "751_Skurvogn pr. kvadratmeter",
