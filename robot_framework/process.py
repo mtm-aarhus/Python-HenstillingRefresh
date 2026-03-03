@@ -1,21 +1,13 @@
-"""This module contains the main process of the robot."""
-
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from datetime import datetime
-import time
-import re
+import json
 import requests
 from functools import lru_cache
 from math import radians, cos, sin, asin, sqrt
 import regex
 from azure.cosmos import CosmosClient
-
 
 CVR_API_URL = "https://cvrapi.dk/api"
 USER_AGENT = "Henstillinger AAK"
@@ -25,18 +17,6 @@ ALLOWED_NUMRE = {
     "1B.", "2B.", "3B.", "4B.", "5B.", "7B.",
     "8B.", "9B.", "10B.", "12B.", "19B.", "23B."
 }
-# TILLADELSESTYPE_MAP = {
-#     "9B.": "Henstilling Stillads m2",
-#     "19B.": "Henstilling Byggeplads m2",
-#     "23B.": "Henstilling Bygninger m2",
-#     "8B.": "Henstilling Container m2",
-#     "5B.": "Henstilling Kran m2",
-#     "4B.": "Henstilling Lift m2",
-#     "12B.": "Henstilling Materiel m2",
-#     "7B.": "Henstilling Skurvogn m2",
-#     "1B.": "Henstilling Afmærkning m2",
-#     "10B.": "Henstilling Materiel m2"
-# }
 
 FAKTURALINJE_MAP = {
     "10B.": "751_Materiel pr. kvadratmeter",
@@ -56,121 +36,265 @@ FAKTURALINJE_MAP = {
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     """Do the primary process of the robot."""
     orchestrator_connection.log_trace("Running process.")
-    Credentials = orchestrator_connection.get_credential("Mobility_Workspace")
-    username = Credentials.username
-    password = Credentials.password
-    url = orchestrator_connection.get_constant("MobilityWorkspaceURL").value
+
+    # --- Credentials / constants ---
+    cred = orchestrator_connection.get_credential("PEZUI")
+    USERNAME = cred.username
+    PASSWORD = cred.password
+
     cosmos_credentials = orchestrator_connection.get_credential("AAKTilsynDB")
     COSMOS_URL = cosmos_credentials.username
     COSMOS_KEY = cosmos_credentials.password
-    
+
     DB_NAME = "aak-tilsyn"
     CONTAINER = "henstillinger"
 
     client = CosmosClient(COSMOS_URL, COSMOS_KEY)
     container = client.get_database_client(DB_NAME).get_container_client(CONTAINER)
-    all_results = []
-    # Azure SQL connection string
 
-        
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument('--remote-debugging-pipe')
-    options.add_experimental_option("prefs", {
-        "download.prompt_for_download": False,
-        "download.directory_upgrade": True,
-        "safebrowsing.enabled": True
+    # --- Requests session (must be reused throughout) ---
+    session = requests.Session()
+    session.headers.update({
+        "accept-language": "en-US,en;q=0.9,en-AU;q=0.8,en-CA;q=0.7,en-IN;q=0.6,en-IE;q=0.5,en-NZ;q=0.4,en-GB-oxendict;q=0.3,en-GB;q=0.2,en-ZA;q=0.1",
+        "sec-ch-ua": '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
     })
 
-    driver = webdriver.Chrome(options=options)
-    wait = WebDriverWait(driver, 20)
+    # 1) Load login page
+    resp = session.get(
+        "https://pez.giantleap.net/login",
+        headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        timeout=30,
+    )
+    resp.raise_for_status()
 
-    driver.get(f"{url}/login")
+    # 2) initiate-login (JSON)
+    resp = session.post(
+        "https://pez.giantleap.net/rest/public/initiate-login",
+        json={"username": USERNAME},
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json;charset=UTF-8",
+            "origin": "https://pez.giantleap.net",
+            "referer": "https://pez.giantleap.net/login",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
 
-    try:
-        wait.until(EC.presence_of_element_located((By.ID, "j_username"))).send_keys(username)
-        driver.find_element(By.NAME, "j_password").send_keys(password)
-        driver.find_element(By.NAME, "submit").click()
-    except Exception:
-        pass  # Login might not be required
+    # 3) oauth token (x-www-form-urlencoded) — pass dict so requests encodes special chars safely
+    resp = session.post(
+        "https://pez.giantleap.net/rest/oauth/token",
+        data={
+            "client_id": "web-client",
+            "grant_type": "password",
+            "username": USERNAME,
+            "password": PASSWORD,
+        },
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": "https://pez.giantleap.net",
+            "referer": "https://pez.giantleap.net/login",
+            "authorization": "Basic d2ViLWNsaWVudDp3ZWItY2xpZW50",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    access_token = data["access_token"]
 
-    # --- Navigate to the correct page ---
-    driver.get(f"{url}/parking/tab/1.2")
+    # --- Fetch list of cases (paged) ---
+    base_url = "https://pez.giantleap.net/rest/tickets/cases"
 
-        # Reset first to '- Vælg -'
-    select_predefined_filter(driver, wait, "")
+    params = {
+        "case_type": "PARKING_TICKET",
+        "contract": "35e4ac45-f820-48a5-b156-ae24b76e4ae4",
+        "current_step": "2a8e5c34-ed88-4c9c-9d3b-a6af1013b3c1",
+        "limit": 50,
+        "offset": 0,
+        "q": "",
+        "sort_column": "date",
+        "sort_direction": "DESC",
+    }
 
-    # Then select your actual one
-    select_predefined_filter(driver, wait, "5aac770d-73ad-40ca-9493-42cfc7f2b1c3")
+    headers_list = {
+        "accept": "application/json, text/plain, */*",
+        "authorization": f"Bearer {access_token}",
+        "referer": "https://pez.giantleap.net/cases",
+        "x-bpid": "bp_aarhus",
+        "x-gltlocale": "da",
+    }
 
-    # (optional) wait for the table or 'Søg' button to appear again
-    wait.until(EC.presence_of_element_located((By.XPATH, "//input[@value='Søg']")))
-
-    # Click "Søg"
-    search_button = driver.find_element(By.XPATH, "//input[@type='submit' and @value='Søg']")
-    search_button.click()
-    
-    # --- After clicking "Søg" ---
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.tabell.radlink")))
-
-    prev_btn = driver.find_element(
-                By.XPATH, "//button[contains(@title, 'Go to previous page')]"
-            )
-    if not prev_btn.get_attribute("disabled"):
-        first_page_link = driver.find_element(
-            By.XPATH, "//a[@title='Go to page 1']"
-        )
-        driver.execute_script("arguments[0].click();", first_page_link)
-
-        # Wait for the first page to become active (no href, title='Go to page 1')
-        wait.until(EC.presence_of_element_located((
-            By.XPATH, "//span[@title='Go to page 1'][not(ancestor::a)]"
-        )))
-        
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table.tabell.radlink")))
-        
-        
     all_results = []
-    page_number = 1
     while True:
-        all_results.extend(process_page(driver, wait, container, orchestrator_connection, all_results))
+        response = session.get(base_url, headers=headers_list, params=params, timeout=60)
+        response.raise_for_status()
+        j = response.json()
 
-        # Try clicking "Næste" if it exists
-        next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Næste')]")))
-        next_btn.click()
-        page_number += 1
-        page_xpath = f"//span[@title='Go to page {page_number}'][not(ancestor::a)]"
-
-        wait.until(EC.presence_of_element_located((By.XPATH, page_xpath)))
-        wait.until(EC.presence_of_element_located(
-        (By.XPATH, "//th[a[normalize-space(text())='Overtrædelse 1']]")
-        ))
-
-        # Return rows of that table
-        table = driver.find_element(
-            By.XPATH, "//table[.//th[a[normalize-space(text())='Overtrædelse 1']]]"
-        )
-        rows = table.find_elements(By.CSS_SELECTOR, "tbody tr.tabellrad")
-        if len(rows) == 0:
-            break
-        if page_number > 50:
+        all_results.extend(j.get("results", []))
+        if not j.get("hasMore"):
             break
 
-    driver.quit()
-    orchestrator_connection.log_info("All pages processed and saved.")
+        params["offset"] += params["limit"]
+
+    orchestrator_connection.log_info(f"Fetched {len(all_results)} total cases")
+
+    # --- Per-case processing ---
+    headers_detail = {
+        "accept": "application/json, text/plain, */*",
+        "authorization": f"Bearer {access_token}",
+        "priority": "u=1, i",
+        "x-bpid": "bp_aarhus",
+        "x-gltlocale": "da",
+    }
+
+    processed = 0
+    skipped = 0
+
+    for case in all_results:
+        case_id = case.get("id")
+        if not case_id:
+            skipped += 1
+            continue
+
+        # Case detail
+        url = f"https://pez.giantleap.net/rest/tickets/cases/{case_id}"
+        response = session.get(url, headers=headers_detail, timeout=60)
+        if response.status_code != 200:
+            skipped += 1
+            continue
+        cjson = response.json().get("result") or {}
+
+        henstilling_id = cjson.get("number")  # matches prior "Nummer"
+        if not henstilling_id:
+            skipped += 1
+            continue
+
+        ticket = cjson.get("parkingTicket") or {}
+
+        streetname = (ticket.get("streetLocation") or {}).get("streetName")
+        housenumber = (ticket.get("streetLocation") or {}).get("houseNumber")
+        locationby = ticket.get("locationBy")
+
+        if not streetname:
+            orchestrator_connection.log_info(f"Missing streetName for {henstilling_id}, skipping entry.")
+            skipped += 1
+            continue
+
+        address_short = streetname
+        if housenumber:
+            address_short = f"{address_short} {housenumber}"
+
+        address_text = address_short
+        if locationby:
+            address_text = f"{address_text} - {locationby}"
+
+        latitude = (ticket.get("coordinates") or {}).get("latitude")
+        longitude = (ticket.get("coordinates") or {}).get("longitude")
+
+        from_time_raw = ticket.get("fromTime")
+        to_time_raw = ticket.get("toTime")
+        if from_time_raw:
+            startdato = datetime.strptime(from_time_raw, "%Y-%m-%d %H:%M:%S").date()
+        if to_time_raw:
+            slutdato = datetime.strptime(to_time_raw, "%Y-%m-%d %H:%M:%S").date()
+
+        # Violations (max 3, sometimes fewer)
+        violations_raw = {
+            1: ticket.get("violation1Name"),
+            2: ticket.get("violation2Name"),
+            3: ticket.get("violation3Name"),
+        }
+
+        forseelser = []
+
+        for nummer, v in violations_raw.items():
+            if not v or not isinstance(v, str):
+                continue
+
+            tokens = v.strip().split(maxsplit=1)
+            if not tokens:
+                continue
+
+            first = tokens[0]  # e.g. "9B."
+
+            if first in ALLOWED_NUMRE:
+                tilladelsestype = FAKTURALINJE_MAP.get(first)
+
+                forseelser.append({
+                    "nummer": nummer,  # now comes directly from violation index
+                    "text": v.strip(),
+                    "tilladelsestype": tilladelsestype
+                })
+
+        if len(forseelser) == 0:
+            skipped += 1
+            continue
+
+        # Vehicle owners (company + CVR)
+        url = f"https://pez.giantleap.net/rest/tickets/cases/{case_id}/vehicle-owners"
+        response = session.get(url, headers=headers_detail, timeout=60)
+        if response.status_code != 200:
+            skipped += 1
+            continue
+        vjson = response.json().get("result") or {}
+
+        category = vjson.get("category")
+        cvr_raw = vjson.get("identificationNumber")
 
 
 
-def extract_latlon_from_maplink(driver):
-    """Find Google Maps link and extract lat/lon if present."""
-    try:
-        link = driver.find_element(By.XPATH, "//a[contains(@href, 'maps.google.com/maps?ll=')]").get_attribute("href")
-        match = re.search(r"ll=([-+]?\d*\.\d+),([-+]?\d*\.\d+)", link)
-        if match:
-            return float(match.group(1)), float(match.group(2))
-    except Exception:
-        pass
-    return None, None
+        if not cvr_raw or not isinstance(cvr_raw, str):
+            # orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
+            skipped += 1
+            continue
+
+        cvr = cvr_raw.strip()
+        if not is_valid_cvr(cvr):
+            # orchestrator_connection.log_info(f"Invalid CVR '{cvr_raw}' for {henstilling_id}, skipping entry.")
+            skipped += 1
+            continue
+
+        # Coordinates too close + geocode fallback
+        if latitude and longitude:
+            try:
+                latitude = float(latitude)
+                longitude = float(longitude)
+            except Exception:
+                latitude = None
+                longitude = None
+
+        if latitude and longitude:
+            latitude, longitude = replace_coord_if_too_close(address_short, latitude, longitude, 100)
+
+        if not latitude or not longitude:
+            geocoded = geocode_address(address_short)
+            if geocoded:
+                latitude, longitude = geocoded
+
+        # Company name
+        company_name = vjson.get("name")
+        firmanavn = company_name or get_firmanavn_cached(container, cvr) or "Ugyldigt CVR"
+
+        meta = {
+            "cvr": cvr,
+            "firmanavn": firmanavn,
+            "startdato": startdato,
+            "slutdato": slutdato,
+            "adresse": address_text,
+            "latitude": latitude,
+            "longitude": longitude
+        }
+
+        sync_henstilling(container, henstilling_id, forseelser, meta, case_id, session, access_token)
+
+        processed += 1
+
+    orchestrator_connection.log_info(f"Done. Processed={processed}, Skipped={skipped}")
+
 
 def haversine(coord1, coord2):
     lat1, lon1 = coord1
@@ -181,7 +305,8 @@ def haversine(coord1, coord2):
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     c = 2 * asin(sqrt(a))
     return R * c
-    
+
+
 def geocode_address(address: str) -> tuple | None:
     url = "https://nominatim.openstreetmap.org/search"
     params = {
@@ -189,9 +314,7 @@ def geocode_address(address: str) -> tuple | None:
         "format": "json",
         "limit": 1,
     }
-    headers = {
-        "User-Agent": "AarhusRoutePlanner/1.0 (aarhuskommune.dk)"
-    }
+    headers = {"User-Agent": "AarhusRoutePlanner/1.0 (aarhuskommune.dk)"}
     try:
         r = requests.get(url, params=params, headers=headers, timeout=5)
         r.raise_for_status()
@@ -202,6 +325,7 @@ def geocode_address(address: str) -> tuple | None:
         print(f"Geocoding failed for '{address}': {e}")
     return None
 
+
 def clean_address(address: str) -> str:
     address = regex.sub(r"(\d+[A-Za-z]?)-\d+[A-Za-z]?", r"\1", address.strip())
     match = regex.search(r"([\p{L} .\-]+?)\s+(\d+[A-Za-z]?)", address)
@@ -209,6 +333,7 @@ def clean_address(address: str) -> str:
         street, number = match.groups()
         return f"{street.strip()} {number.strip()}"
     return None
+
 
 def replace_coord_if_too_close(address, latitude, longitude, threshold_m=100) -> dict:
     coord = (latitude, longitude)
@@ -225,218 +350,6 @@ def replace_coord_if_too_close(address, latitude, longitude, threshold_m=100) ->
         longitude = new_coord[1]
     return latitude, longitude
 
-def process_page(driver, wait, container, orchestrator_connection, all_results):
-    """Iterate rows, open details, extract widgets, update/insert DB."""
-    rows = driver.find_elements(By.CSS_SELECTOR, "table.tabell.radlink tbody tr.tabellrad")
-    total_rows = len(rows)
-    orchestrator_connection.log_info(f"Found {total_rows} rows on this page.")
-
-    for idx in range(total_rows):
-        # Wait for the header to appear (ensures correct table)
-        wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//th[a[normalize-space(text())='Overtrædelse 1']]")
-        ))
-
-        # Once header is present, safely get all rows under that table
-        table = driver.find_element(
-            By.XPATH, "//table[.//th[a[normalize-space(text())='Overtrædelse 1']]]"
-        )
-        rows = table.find_elements(By.CSS_SELECTOR, "tbody tr.tabellrad")
-        row = rows[idx]
-        driver.execute_script("arguments[0].scrollIntoView(true);", row)
-        row.click()
-        back_link = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.tilbakelink")))
-
-        # --- Extract all widgets ---
-        widgets = extract_all_widgets(driver)
-        
-        overtrædelse_info = widgets.get("Overtrædelse", {})
-        ejerinfo = widgets.get("Ejerinfo", {})
-        kontrol_info = widgets.get("Kontrolgebyrsinformation", {})
-        
-        henstilling_id = kontrol_info.get("Nummer")
-        
-        if not henstilling_id:
-            orchestrator_connection.log_info("Missing Henstilling ID, skipping entry.")
-            back_link.click()
-            continue
-
-        
-        forseelser = []
-
-        for k, v in (overtrædelse_info or {}).items():
-            if not v or not isinstance(v, str) or not k.lower().startswith("overtrædelse"):
-                continue
-
-            tokens = v.strip().split(maxsplit=1)
-            first = tokens[0]  # e.g. "9B."
-
-            if first in ALLOWED_NUMRE:
-                nummer = int(k.split()[-1])
-                tilladelsestype = FAKTURALINJE_MAP.get(first)
-                forseelser.append({
-                    "nummer": nummer,
-                    "text": v.strip(),
-                    "tilladelsestype": tilladelsestype
-                })
-
-        if len(forseelser) == 0:
-            back_link.click()
-            continue
-        
-        cvr = None
-        type_value = ejerinfo.get("Type")
-
-        if type_value != "Organisationsnr.":
-            orchestrator_connection.log_info(f"Not a company (Type={type_value}) for {henstilling_id}, skipping entry."            )
-            back_link.click()
-            continue
-
-        cvr_raw = ejerinfo.get("Nummer")
-
-        if not cvr_raw:
-            orchestrator_connection.log_info(f"Missing CVR for {henstilling_id}, skipping entry.")
-            back_link.click()
-            continue
-
-        if is_valid_cvr(cvr_raw):
-            cvr = int(cvr_raw)
-        else:
-            orchestrator_connection.log_info(f"Invalid CVR '{cvr_raw}' for {henstilling_id}, skipping entry.")
-            back_link.click()
-            continue
-
-
-
-        # --- Latitude/Longitude ---
-        latitude, longitude = extract_latlon_from_maplink(driver)
-        # --- Fallback to geocoding if no coords ---
-        Vejnavn = kontrol_info.get("Gade") or None
-        Husnummer = kontrol_info.get("Husnummer") or None
-        address_text = None
-        if Vejnavn:
-            if Husnummer:
-                address_text = Vejnavn+" "+Husnummer
-            else:
-                address_text = Vejnavn
-                
-        if latitude and longitude:
-            latitude, longitude = replace_coord_if_too_close(address_text, latitude, longitude, 100)
-        
-        if not latitude or not longitude:
-            if address_text:
-                geocoded = geocode_address(address_text)
-                if geocoded:
-                    latitude, longitude = geocoded
-
-        # --- CVR and company name lookup ---
-
-        
-        firmanavn = ejerinfo.get("Navn") or get_firmanavn_cached(container, cvr) or "Ugyldigt CVR"
-
-        # --- Start/End Dates ---
-        startdato = kontrol_info.get("Fra")
-        slutdato = kontrol_info.get("Til")
-        
-        try:
-            if startdato:
-                startdato = datetime.strptime(startdato.split()[0], "%d-%m-%y").date()
-            if slutdato:
-                slutdato = datetime.strptime(slutdato.split()[0], "%d-%m-%y").date()
-        except Exception:
-            startdato = slutdato = None
-
-        try:
-            if kontrol_info.get("Fra"):
-                startdato = datetime.strptime(kontrol_info["Fra"].split()[0], "%d-%m-%y").date()
-            if kontrol_info.get("Til"):
-                slutdato = datetime.strptime(kontrol_info["Til"].split()[0], "%d-%m-%y").date()
-        except Exception:
-            pass
-
-
-        meta = {
-            "cvr": cvr,
-            "firmanavn": firmanavn,
-            "startdato": startdato,
-            "slutdato": slutdato,
-            "adresse": address_text,
-            "latitude": latitude,
-            "longitude": longitude
-        }
-        sync_henstilling(container, henstilling_id, forseelser, meta)
-        back_link.click()
-    return all_results
-
-def extract_all_widgets(driver):
-    """
-    Dynamically extract all widgets on the page based on their <h3> titles
-    and the content under .widgetinnhold. Returns a dict of dicts/lists.
-    """
-    widgets_data = {}
-
-    widgets = driver.find_elements(By.CSS_SELECTOR, "div.widget")
-    for widget in widgets:
-        try:
-            # Get the title (widgethead > h3)
-            title_el = widget.find_element(By.CSS_SELECTOR, ".widgethead h3")
-            title = title_el.text.strip()
-            if not title:
-                continue
-        except Exception:
-            continue
-
-        # Find the visible content section
-        try:
-            content_el = widget.find_element(By.CSS_SELECTOR, ".widgetinnhold")
-        except Exception:
-            continue
-
-        # Try to parse the content heuristically
-        section_data = parse_widget_content(content_el)
-        widgets_data[title] = section_data
-
-    return widgets_data
-
-
-def parse_widget_content(content_el):
-    """
-    Generic parser for the inner content of a widget.
-    Handles:
-    - propertytable (th/td pairs)
-    - tabell with headers
-    - plain text / spans
-    """
-    data = {}
-
-    # --- Case 1: Standard key/value table (propertytable) ---
-    kv_rows = content_el.find_elements(By.XPATH, ".//table[contains(@class,'propertytable')]/tbody/tr")
-    if kv_rows:
-        for tr in kv_rows:
-            try:
-                key = tr.find_element(By.TAG_NAME, "th").text.strip().rstrip(":")
-                val = tr.find_element(By.TAG_NAME, "td").text.strip()
-                data[key] = val
-            except Exception:
-                continue
-        return data
-
-    # --- Case 2: Tabular comment/record list ---
-    tab_rows = content_el.find_elements(By.XPATH, ".//table[contains(@class,'tabell')]/tbody/tr")
-    if tab_rows:
-        table_data = []
-        for tr in tab_rows:
-            cells = [td.text.strip() for td in tr.find_elements(By.TAG_NAME, "td")]
-            if any(cells):
-                table_data.append(cells)
-        return table_data
-
-    # --- Case 3: Plain text or nested spans ---
-    text_content = content_el.text.strip()
-    if text_content:
-        return text_content
-
-    return {}
 
 
 @lru_cache(maxsize=5000)
@@ -460,8 +373,12 @@ def get_firmanavn_cached(container, cvr: int):
 
     # Fallback to CVR API
     try:
-        r = requests.get(CVR_API_URL, params={"country": "dk", "search": cvr},
-                         headers={"User-Agent": USER_AGENT}, timeout=5)
+        r = requests.get(
+            CVR_API_URL,
+            params={"country": "dk", "search": cvr},
+            headers={"User-Agent": USER_AGENT},
+            timeout=5
+        )
         if r.status_code == 200:
             data = r.json()
             return data.get("name")
@@ -469,7 +386,8 @@ def get_firmanavn_cached(container, cvr: int):
         print(f"CVR lookup failed for {cvr}: {e}")
     return None
 
-def sync_henstilling(container, henstilling_id, forseelser, meta):
+
+def sync_henstilling(container, henstilling_id, forseelser, meta, case_uuid, session, access_token):
     """
     Sync henstilling data in Cosmos DB:
     - Only inserts or updates rows that are 'Ny'
@@ -477,14 +395,12 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
     - Efficiently upserts items using partition keys
     """
 
-    # Fetch all docs for this Henstilling (any FakturaStatus)
     existing_docs = list(container.query_items(
         query="SELECT * FROM c WHERE c.HenstillingId = @h",
         parameters=[{"name": "@h", "value": henstilling_id}],
         enable_cross_partition_query=True
     ))
 
-    # Build quick lookup by ID
     existing_map = {d["id"]: d for d in existing_docs}
 
     for f in forseelser:
@@ -493,15 +409,14 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
 
         # Skip locked statuses
         if existing and existing.get("FakturaStatus") not in ("Ny"):
-            continue  # do not modify rows in other statuses
+            continue
 
-
-        # Build new or updated item
         item = {
             "id": fid,
             "HenstillingId": henstilling_id,
+            "PEZUUID": case_uuid,
             "ForseelseNr": f["nummer"],
-            "Forseelse": f["text"].strip().split(" ", 1)[1],
+            "Forseelse": f["text"],
             "CVR": meta.get("cvr"),
             "FirmaNavn": meta.get("firmanavn"),
             "Adresse": meta.get("adresse"),
@@ -510,34 +425,21 @@ def sync_henstilling(container, henstilling_id, forseelser, meta):
             "Startdato": str(meta.get("startdato")),
             "Slutdato": existing.get("Slutdato") if existing else None,
             "Kvadratmeter": existing.get("Kvadratmeter") if existing else None,
-            "Tilladelsestype": (existing.get("Tilladelsestype") if existing and existing.get("Tilladelsestype") is not None else f.get("tilladelsestype")),
+            "Tilladelsestype": (
+                existing.get("Tilladelsestype")
+                if existing and existing.get("Tilladelsestype") is not None
+                else f.get("tilladelsestype")
+            ),
             "FakturaStatus": "Ny",
         }
 
-        # Upsert is cheap and works fine when the partition key stays the same
         container.upsert_item(body=item)
-
-            
-def select_predefined_filter(driver, wait, value):
-    """Selects a predefined filter safely, even after Wicket re-renders the DOM."""
-    select_xpath = "//select[@name='topLevelTabContent:content:filterPanel:predefinedFilter:definition']"
-
-    # Find the dropdown fresh every time
-    select_el = wait.until(EC.presence_of_element_located((By.XPATH, select_xpath)))
-
-    # Set the value and trigger change
-    driver.execute_script("""
-        const el = arguments[0];
-        el.value = arguments[1];
-        el.dispatchEvent(new Event('change'));
-    """, select_el, value)
-
-    # Wait for the next version of the dropdown to appear
-    time.sleep(1)
-    wait.until(EC.staleness_of(select_el))
-    wait.until(EC.presence_of_element_located((By.XPATH, select_xpath)))
-
     
+    if len(existing_docs) == 0:
+        add_sent_to_tilsyn_comment(session, access_token, case_uuid, forseelser)
+
+
+
 def is_valid_cvr(cvr_str: str) -> bool:
     """Return True if CVR has 8 digits and passes modulus-11 validation."""
     if len(cvr_str) != 8 or not cvr_str.isdigit():
@@ -547,3 +449,47 @@ def is_valid_cvr(cvr_str: str) -> bool:
     total = sum(int(d) * w for d, w in zip(cvr_str, weights))
 
     return total % 11 == 0
+
+
+def add_sent_to_tilsyn_comment(session: requests.Session, access_token: str, case_uuid: str, forseelser: list[dict]) -> None:
+    url = f"https://pez.giantleap.net/rest/tickets/cases/{case_uuid}/comments"
+
+    summary = format_afvigelser_summary(forseelser)
+    payload = {
+        "comment": f"Sendt til AAK Tilsyn -> {summary}",
+        "isInternal": True,
+    }
+
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "authorization": f"Bearer {access_token}",
+        "content-type": "application/json;charset=UTF-8",
+        "priority": "u=1, i",
+        "x-bpid": "bp_aarhus",
+        "x-gltlocale": "da",
+    }
+
+    r = session.post(url, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+
+
+def format_afvigelser_summary(forseelser: list[dict]) -> str:
+    """
+    Output example:
+    Afvigelse 1: 4B. Lifte ol. opstillet uden tilladelse;
+    Afvigelse 2: 10B. Byggematerialer/affald placeret uden tilladelse.
+    (but in one single line)
+    """
+    parts = []
+
+    for f in sorted(forseelser, key=lambda x: x.get("nummer", 0)):
+        nummer = f.get("nummer")
+        text = (f.get("text") or "").strip()
+
+        # Ensure text ends with a period for consistency
+        if text and not text.endswith("."):
+            text = text + "."
+
+        parts.append(f"Afvigelse {nummer}: {text}")
+
+    return " | ".join(parts)
