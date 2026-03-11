@@ -1,23 +1,29 @@
-# 🚦 Henstillinger Automation Robot (Aarhus Kommune)
+# Henstillinger Automation Robot (Aarhus Kommune)
 
-This automation robot is designed to download, process, and update enforcement notices ("Henstillinger") from the Mobility Workspace system of Aarhus Kommune. It integrates with Azure SQL, fetches new or updated data via Selenium, performs CVR lookups, and maintains a local dataset in the `VejmanKassen` table.
+This automation robot retrieves, processes, and synchronizes enforcement notices ("Henstillinger") from the **PEZ system** used by Aarhus Kommune. It communicates directly with the **PEZ REST API**, processes relevant enforcement cases, performs validation and enrichment (such as CVR lookup and geolocation correction), and maintains a dataset in **Azure Cosmos DB**.
+
+The robot runs within the **OpenOrchestrator** framework and is designed for unattended automation.
+
+---
 
 ## 🧩 Features
 
-* Headless login and CSV export from Aarhus Mobility Workspace
-* Automatic download detection
+* Secure authentication against the **PEZ REST API**
+* Fast retrieval of enforcement cases using paginated REST endpoints
+* Detailed case inspection including violations, location, and owner data
 * CVR-based company name enrichment using `cvrapi.dk`
-* Conditional database update logic for enforcement cases
-* Geolocation correction using OpenStreetMap (Nominatim) if coordinates are too close to the workplace.
-* Built-in safeguards to prevent overwriting finalized invoices (`FakturaStatus`)
+* Automatic geolocation correction using OpenStreetMap (Nominatim) if coordinates are too close to the workplace
+* Conditional database update logic to protect already processed invoices
+* Cosmos DB synchronization with upsert logic
+* Built-in caching of company lookups to minimize external API calls
 
 ---
 
 ## 🏗️ Tech Stack
 
 * **Python 3.10+**
-* **Selenium** (for headless browser automation)
-* **pyodbc** (for SQL Server database interaction)
+* **Requests** (for REST API communication)
+* **Azure Cosmos DB SDK**
 * **cvrapi.dk** (for company name lookup)
 * **OpenStreetMap Nominatim API** (for geolocation correction)
 * **OpenOrchestrator** (for secure secrets and configuration management)
@@ -30,27 +36,41 @@ This automation robot is designed to download, process, and update enforcement n
 
 Ensure the following are installed:
 
-* Chrome Browser
-* ChromeDriver (match your Chrome version)
-* ODBC Driver 17 for SQL Server
+* Python 3.10+
 * Python packages:
 
-  ```bash
-  pip install selenium pyodbc requests regex
-  ```
+```bash
+pip install requests azure-cosmos regex
+```
 
+### OpenOrchestrator Configuration
+
+The robot expects the following credentials to be configured in **OpenOrchestrator**:
+
+| Credential Name | Purpose                                                           |
+| --------------- | ----------------------------------------------------------------- |
+| `PEZUI`         | Username and password used to authenticate against the PEZ system |
+| `AAKTilsynDB`   | Azure Cosmos DB endpoint and key                                  |
+
+---
 
 ## 🚀 Usage
 
-The `process()` function is the robot's main entry point. It:
+The `process()` function is the robot's main entry point.
 
-1. Logs in to Mobility Workspace
-2. Navigates to the *Henstillinger* tab and sets a date filter
-3. Downloads the resulting CSV
-4. Parses and processes each row
-5. Updates or inserts data into `dbo.VejmanKassen`
-6. Optionally fetches missing company names via CVR API
-7. Corrects suspicious coordinates based on proximity to the depot
+It performs the following workflow:
+
+1. Authenticates against the **PEZ API** using OAuth
+2. Fetches enforcement cases (`PARKING_TICKET`) from the PEZ system using paginated REST requests
+3. Retrieves detailed information for each case
+4. Fetches the vehicle owner information
+5. Filters violations to only those that are billable
+6. Validates CVR numbers
+7. Enriches company names when necessary
+8. Corrects suspicious coordinates based on proximity to the depot
+9. Inserts or updates records in **Cosmos DB**
+
+Example usage:
 
 ```python
 from robot_module import process
@@ -69,35 +89,65 @@ Rows are skipped from update **if**:
 FakturaStatus is not None and FakturaStatus != "Ny"
 ```
 
-This ensures finalized invoices or those beyond "Ny" status are left untouched.
+This ensures finalized invoices or those beyond `"Ny"` status remain untouched.
+
+---
+
+### Violation Filtering
+
+Only specific violation types are eligible for invoicing. These are identified by codes such as:
+
+```
+1B., 2B., 3B., 4B., 5B., 7B., 8B., 9B., 10B., 12B., 19B., 23B.
+```
+
+Each case can contain **up to three violations**, and only valid ones are processed.
 
 ---
 
 ### Coordinate Correction
 
-If the location is too close to the depot (less than 100 meters), coordinates are re-derived via OpenStreetMap geocoding based on street address.
+If the location coordinates are within **100 meters of the depot**, they are considered unreliable and replaced by coordinates derived via **OpenStreetMap geocoding** using the street address.
 
 ---
 
-## 📂 Output Table Structure (`[dbo].[VejmanKassen]`)
+### CVR Validation
 
-| Column          | Notes                             |
-| --------------- | --------------------------------- |
-| `HenstillingId` | Unique case identifier            |
-| `CVR`           | Company registration number       |
-| `FirmaNavn`     | Resolved via CVR lookup           |
-| `Startdato`     | Start date of enforcement         |
-| `Slutdato`      | End date                          |
-| `Adresse`       | Resolved street + house number    |
-| `Forseelse`     | Description of violation          |
-| `Longitude`     | Geolocation (corrected if needed) |
-| `Latitude`      | Geolocation (corrected if needed) |
-| `FakturaStatus` | Defaults to `"Ny"` if inserted    |
+The robot performs:
+
+* Format validation (8 digits)
+* **Modulus-11 validation**
+
+Only valid company CVR numbers are accepted.
+
+---
+
+## 📂 Database Structure (Cosmos DB Container: `henstillinger`)
+
+Each violation becomes its own document.
+
+| Field             | Description                                     |
+| ----------------- | ----------------------------------------------- |
+| `id`              | Unique identifier (`HenstillingId_ForseelseNr`) |
+| `HenstillingId`   | Enforcement case number                         |
+| `ForseelseNr`     | Violation number (1–3)                          |
+| `Forseelse`       | Violation description                           |
+| `CVR`             | Company registration number                     |
+| `FirmaNavn`       | Company name                                    |
+| `Adresse`         | Street and house number                         |
+| `Latitude`        | Coordinates (corrected if necessary)            |
+| `Longitude`       | Coordinates (corrected if necessary)            |
+| `Startdato`       | Start date of enforcement                       |
+| `Slutdato`        | End date                                        |
+| `Kvadratmeter`    | Area value (if set later)                       |
+| `Tilladelsestype` | Billing type                                    |
+| `FakturaStatus`   | Defaults to `"Ny"`                              |
 
 ---
 
 ## 🌐 External APIs
 
+* **PEZ API** – internal Aarhus Kommune enforcement system
 * [CVR API](https://cvrapi.dk/)
 * [OpenStreetMap Nominatim](https://nominatim.org/release-docs/develop/api/Search/)
 
@@ -105,11 +155,10 @@ If the location is too close to the depot (less than 100 meters), coordinates ar
 
 ## 📌 Notes
 
-* Geolocation and CVR lookups have built-in fallback and logging for resilience.
-* All downloaded CSVs are deleted after processing.
-* The robot runs headlessly and can be integrated into unattended automation flows.
-
----
+* CVR lookups are cached to minimize external API requests.
+* Geolocation correction ensures reliable coordinates for enforcement cases.
+* Existing records with locked statuses are never modified.
+* Designed for unattended execution via **OpenOrchestrator**.
 
 
 # Robot-Framework V3
